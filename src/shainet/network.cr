@@ -2,6 +2,10 @@ require "logger"
 require "json"
 
 module SHAInet
+
+  @graph : Visualizer
+  @ready : Channel(String)
+
   class Network
     # # Notes:
     # # ------------
@@ -54,6 +58,9 @@ module SHAInet
       @beta2 = Float64.new(0.999)        # For Adam , exponential decay rate (not recommended to change value)
       @epsilon = Float64.new(10**(-8.0)) # For Adam , prevents exploding gradients (not recommended to change value)
       @time_step = 0                     # For Adam
+      @all_weights = Array(Array(Float64)).new
+      @last_time = 0_i64
+      @timer = Timer.new
     end
 
     # Create and populate a layer with neurons
@@ -227,7 +234,8 @@ module SHAInet
           neuron = @output_layers.last.neurons[i] # Update error of all neurons in the output layer based on the actual result
           neuron.gradient = SHAInet.quadratic_cost_derivative(expected[i].to_f64, actual[i].to_f64)*neuron.sigma_prime
           # TODO: add support for multiple output layers
-          @error_signal << SHAInet.quadratic_cost(expected[i].to_f64, actual[i].to_f64) # Store the output error based on cost function
+          error_signal = SHAInet.quadratic_cost(expected[i].to_f64, actual[i].to_f64)
+          @error_signal << error_signal # Store the output error based on cost function
         end
       when "c_ent"
         expected.size.times do |i|
@@ -279,7 +287,11 @@ module SHAInet
       end
     end
 
-    def log_summery(e)
+    def all_weights
+      @all_weights
+    end
+
+    def log_summary(e)
       @logger.info("Epoch: #{e}, Total error: #{@total_error}, MSE: #{@mean_error}")
     end
 
@@ -290,16 +302,29 @@ module SHAInet
               epochs : Int32,                     # a criteria of when to stop the training
               error_threshold : Float64,          # a criteria of when to stop the training
               log_each : Int32 = 1000)            # determines what is the step for error printout
-
+      @timer = Timer.new(log_each) if @graph_mode
       verify_data(data)
       @logger.info("Training started")
       loop do |e|
-        if e % log_each == 0
-          log_summery(e)
+        Fiber.yield
+        if @graph_mode
+          if @timer.update?
+            update_graph(e)
+          end
+        else
+          if e % log_each == 0
+            log_summary(e)
+          end
         end
         if e >= epochs || (error_threshold >= @mean_error) && (e > 0)
-          log_summery(e)
-          break
+          if @graph_mode
+            update_graph(e)
+            sleep 1
+            break
+          else
+            log_summary(e)
+            break
+          end
         end
 
         # Go over each data point and update the weights/biases based on the specific example
@@ -343,6 +368,7 @@ module SHAInet
                     error_threshold : Float64,          # a criteria of when to stop the training
                     log_each : Int32 = 1000,            # determines what is the step for error printout
                     mini_batch_size : Int32 | Nil = nil)
+      @timer = Timer.new(log_each) if @graph_mode
       @logger.info("Training started")
       batch_size = mini_batch_size ? mini_batch_size : data.size
       @time_step = 0
@@ -351,12 +377,25 @@ module SHAInet
         @logger.info("Working on mini-batch size: #{batch_size}") if mini_batch_size
         @time_step += 1 if mini_batch_size # in mini-batch update adam time_step
         loop do |e|
-          if e % log_each == 0
-            log_summery(e)
+          Fiber.yield
+          if @graph_mode
+            if @timer.update?
+              update_graph(e)
+            end
+          else
+            if e % log_each == 0
+              log_summary(e)
+            end
           end
           if e >= epochs || (error_threshold >= @mean_error) && (e > 0)
-            log_summery(e)
-            break
+            if @graph_mode
+              update_graph(e)
+              sleep 1
+              break
+            else
+              log_summary(e)
+              break
+            end
           end
           batch_mean = [] of Float64
           all_errors = [] of Float64
@@ -374,7 +413,10 @@ module SHAInet
 
             # Sum all gradients from each data point for the batch update
             @all_synapses.each_with_index { |synapse, i| @w_gradient[i] += (synapse.source_neuron.activation)*(synapse.dest_neuron.gradient) }
-            @all_neurons.each_with_index { |neuron, i| @b_gradient[i] += neuron.bias }
+            @all_neurons.each_with_index { |neuron, i|
+              Fiber.yield
+              @b_gradient[i] += neuron.bias
+            }
 
             # Calculate MSE per data point
             if @error_signal.size == 1
@@ -383,8 +425,9 @@ module SHAInet
               error_avg = @total_error/@output_layers.last.neurons.size
             end
             sqrd_dists = [] of Float64
-            @error_signal.each { |e| sqrd_dists << (e - error_avg)**2 }
-
+            @error_signal.each { |e|
+              sqrd_dists << (e - error_avg)**2
+            }
             @mean_error = (sqrd_dists.reduce { |acc, i| acc + i })/@output_layers.last.neurons.size
             batch_mean << @mean_error
           end
@@ -408,6 +451,7 @@ module SHAInet
     # Update weights based on the learning type chosen
     def update_weights(learn_type : Symbol | String, batch : Bool = false)
       @all_synapses.each_with_index do |synapse, i|
+
         # Get current gradient
         if batch == true
           synapse.gradient = @w_gradient.not_nil![i]
@@ -614,6 +658,66 @@ module SHAInet
         end
       end
       @logger.info("Network loaded from: #{file_path}")
+    end
+
+    def graph(title : String, labels : Hash(Symbol, String))
+      @graph = Visualizer.new("#{title}\n\n")
+      @labels = labels
+      @ready = Channel(String).new
+      @graph_mode = true
+      run_server
+    end
+
+    def run_server
+      spawn do
+        graph = Graph.new(@ready.not_nil!)
+        graph.start
+      end
+      puts ("SHAInet running at localhost:3000:")
+    end
+
+    def update_graph(e)
+      activations = Array(Array(Float64)).new
+      hidden_sizes = Array(Int32).new
+      @hidden_layers.each do |l|
+        activation = Array(Float64).new
+        l.neurons.each_with_index do |neuron, idx|
+          activation << neuron.activation
+        end
+        activations << activation
+        hidden_sizes << activation.size
+      end
+
+      @error_signal.each_with_index do |es, idx|
+      end
+
+      if e > 0
+        if graph = @graph
+          if labels = @labels
+            unless graph.started
+              graph.input = {name: labels[:input],
+                             size: 4}
+              graph.hidden = {count:  activations.size,
+                              sizes: hidden_sizes,
+                              values: activations}
+              graph.output = {name: labels[:output],
+                              size: @error_signal.size,
+                              values: @error_signal.map{ |es| es.round(4)} }
+              graph.start
+            end
+            graph.hidden = {count:  activations.size,
+                            sizes: hidden_sizes,
+                            values: activations}
+            graph.output = {name: "Error Signal",
+                            label: e,
+                            size: @error_signal.size,
+                            values: @error_signal.map{ |es| es.round(3)} }
+            graph.update
+            @ready.not_nil!.send "Epoch: #{e}, Total error: #{@total_error}, MSE: #{@mean_error}"
+            Fiber.yield
+          end
+        end
+      end
     end
 
     def inspect
