@@ -293,7 +293,8 @@ module SHAInet
     end
 
     def cmd(format = "plain", outfile = "")
-      `echo '#{to_s}' | #{DOT_COMMAND} -T#{format} -o#{outfile}`
+      outp = outfile.empty? ? "" : " -o#{outfile}"
+      `echo '#{to_s}' | #{DOT_COMMAND} -T#{format}#{outp}`
     end
 
     def start
