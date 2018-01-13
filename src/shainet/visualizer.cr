@@ -119,7 +119,7 @@ module SHAInet
         input_size = @data.input.size
         input_size.times do |x|
           val_s = build_label(@data.input.values, @data.mapping.input[x])
-          val_s = %w(sl sw pl pw)[@data.mapping.input[x]]
+#          val_s = (x + 1).to_s
           @nodes << inp.add_node(x.to_s, label: val_s,
                                  style: "filled",
                                  color: "midnightblue",

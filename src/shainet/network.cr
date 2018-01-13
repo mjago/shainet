@@ -696,7 +696,7 @@ module SHAInet
           if labels = @labels
             unless graph.started
               graph.input = {name: labels[:input],
-                             size: 4}
+                             size: @input_layers[0].neurons.size}
               graph.hidden = {count:  activations.size,
                               sizes: hidden_sizes,
                               values: activations}
